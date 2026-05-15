@@ -6,9 +6,103 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from test import predict_location, get_ensemble_weight, generate_inpaint_mask
 from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
 from utils.general import *
+
+def get_ensemble_weight(seq_len, eval_mode):
+    """ Get weight for temporal ensemble.
+
+        Args:
+            seq_len (int): Length of input sequence
+            eval_mode (str): Mode of temporal ensemble
+                Choices:
+                    - 'average': Return uniform weight
+                    - 'weight': Return positional weight
+        
+        Returns:
+            weight (torch.Tensor): Weight for temporal ensemble
+    """
+
+    if eval_mode == 'average':
+        weight = torch.ones(seq_len) / seq_len
+    elif eval_mode == 'weight':
+        weight = torch.ones(seq_len)
+        for i in range(math.ceil(seq_len/2)):
+            weight[i] = (i+1)
+            weight[seq_len-i-1] = (i+1)
+        weight = weight / weight.sum()
+    else:
+        raise ValueError('Invalid mode')
+    
+    return weight
+
+
+def generate_inpaint_mask(pred_dict, th_h=30):
+    """ Generate inpaint mask form predicted trajectory.
+
+        Args:
+            pred_dict (Dict): Prediction result
+                Format: {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
+            th_h (float): Height threshold (pixels) for y coordinate
+        
+        Returns:
+            inpaint_mask (List): Inpaint mask
+    """
+    y = np.array(pred_dict['Y'])
+    vis_pred = np.array(pred_dict['Visibility'])
+    inpaint_mask = np.zeros_like(y)
+    i = 0 # index that ball start to disappear
+    j = 0 # index that ball start to appear
+    threshold = th_h
+    while j < len(vis_pred):
+        while i < len(vis_pred)-1 and vis_pred[i] == 1:
+            i += 1
+        j = i
+        while j < len(vis_pred)-1 and vis_pred[j] == 0:
+            j += 1
+        if j == i:
+            break
+        elif i == 0 and y[j] > threshold:
+            # start from the first frame that ball disappear
+            inpaint_mask[:j] = 1
+        elif (i > 1 and y[i-1] > threshold) and (j < len(vis_pred) and y[j] > threshold):
+            inpaint_mask[i:j] = 1
+        else:
+            # ball is out of the field of camera view 
+            pass
+        i = j
+    
+    return inpaint_mask.tolist()
+
+
+def predict_location(heatmap):
+    """ Get coordinates from the heatmap.
+
+        Args:
+            heatmap (numpy.ndarray): A single heatmap with shape (H, W)
+
+        Returns:
+            x, y, w, h (Tuple[int, int, int, int]): bounding box of the the bounding box with max area
+    """
+    if np.amax(heatmap) == 0:
+        # No respond in heatmap
+        return 0, 0, 0, 0
+    else:
+        # Find all respond area in the heapmap
+        (cnts, _) = cv2.findContours(heatmap.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rects = [cv2.boundingRect(ctr) for ctr in cnts]
+
+        # Find largest area amoung all contours
+        max_area_idx = 0
+        max_area = rects[0][2] * rects[0][3]
+        for i in range(1, len(rects)):
+            area = rects[i][2] * rects[i][3]
+            if area > max_area:
+                max_area_idx = i
+                max_area = area
+        x, y, w, h = rects[max_area_idx]
+
+        return x, y, w, h
 
 
 def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
@@ -83,6 +177,8 @@ if __name__ == '__main__':
     parser.add_argument('--traj_len', type=int, default=8, help='length of trajectory to draw on video')
     args = parser.parse_args()
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     num_workers = args.batch_size if args.batch_size <= 16 else 16
     video_file = args.video_file
     video_name = video_file.split('/')[-1][:-4]
@@ -95,16 +191,16 @@ if __name__ == '__main__':
         os.makedirs(args.save_dir)
     
     # Load model
-    tracknet_ckpt = torch.load(args.tracknet_file)
+    tracknet_ckpt = torch.load(args.tracknet_file, map_location=device)
     tracknet_seq_len = tracknet_ckpt['param_dict']['seq_len']
     bg_mode = tracknet_ckpt['param_dict']['bg_mode']
-    tracknet = get_model('TrackNet', tracknet_seq_len, bg_mode).cuda()
+    tracknet = get_model('TrackNet', tracknet_seq_len, bg_mode).to(device)
     tracknet.load_state_dict(tracknet_ckpt['model'])
 
     if args.inpaintnet_file:
-        inpaintnet_ckpt = torch.load(args.inpaintnet_file)
+        inpaintnet_ckpt = torch.load(args.inpaintnet_file, map_location=device)
         inpaintnet_seq_len = inpaintnet_ckpt['param_dict']['seq_len']
-        inpaintnet = get_model('InpaintNet').cuda()
+        inpaintnet = get_model('InpaintNet').to(device)
         inpaintnet.load_state_dict(inpaintnet_ckpt['model'])
     else:
         inpaintnet = None
@@ -135,7 +231,7 @@ if __name__ == '__main__':
             data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
 
         for step, (i, x) in enumerate(tqdm(data_loader)):
-            x = x.float().cuda()
+            x = x.float().to(device)
             with torch.no_grad():
                 y_pred = tracknet(x).detach().cpu()
             
@@ -168,7 +264,7 @@ if __name__ == '__main__':
         y_pred_buffer = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
         weight = get_ensemble_weight(seq_len, args.eval_mode)
         for step, (i, x) in enumerate(tqdm(data_loader)):
-            x = x.float().cuda()
+            x = x.float().to(device)
             b_size, seq_len = i.shape[0], i.shape[1]
             with torch.no_grad():
                 y_pred = tracknet(x).detach().cpu()
@@ -224,7 +320,7 @@ if __name__ == '__main__':
             for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
                 coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
                 with torch.no_grad():
-                    coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
+                    coor_inpaint = inpaintnet(coor_pred.to(device), inpaint_mask.to(device)).detach().cpu()
                     coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # replace predicted coordinates with inpainted coordinates
                 
                 # Thresholding
@@ -253,7 +349,7 @@ if __name__ == '__main__':
                 coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
                 b_size = i.shape[0]
                 with torch.no_grad():
-                    coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
+                    coor_inpaint = inpaintnet(coor_pred.to(device), inpaint_mask.to(device)).detach().cpu()
                     coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask)
                 
                 # Thresholding
